@@ -1,3 +1,4 @@
+
 import asyncio
 import logging
 import os
@@ -25,7 +26,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 # CONFIG
 # =====================================================
 
-TOKEN = os.getenv("BOT_TOKEN", "9161228684:AAFxd7VQ1LwIo2ewaTnc8wQMrjSmGdh8haE")
+TOKEN = os.getenv("BOT_TOKEN", "9161228684:AAFxd7VQ1LwIo2ewaTnc8wQMrjSmGdh8haE").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "8792199502"))
 CHANNEL_ID = os.getenv("ADMIN_CHANNEL_ID", "-1004412233871")
 DB_PATH = os.getenv("DB_PATH", "anonbot.db")
@@ -1290,103 +1291,6 @@ async def department_appoint_start(
 
 
 
-@dp.message(States.appoint_id)
-async def department_appoint_finish(
-    message: Message,
-    state: FSMContext
-):
-    if message.from_user.id != OWNER_ID:
-        await state.clear()
-        return
-
-    if not message.text or not message.text.strip().isdigit():
-        await message.answer("Введите корректный Telegram ID.")
-        return
-
-    target = int(message.text.strip())
-    data = await state.get_data()
-
-    dept_id = data.get("department_id")
-    position = data.get("position")
-
-    if not dept_id or position not in ("head", "deputy"):
-        await message.answer("Ошибка назначения. Начните заново.")
-        await state.clear()
-        return
-
-    if target == OWNER_ID:
-        await message.answer("Создателя нельзя назначить сотрудником.")
-        return
-
-    department = await one(
-        "SELECT name FROM departments WHERE id = ?",
-        (dept_id,)
-    )
-
-    if not department:
-        await message.answer("Отделение не найдено.")
-        await state.clear()
-        return
-
-    old_admin = await get_admin(target)
-
-    level = old_admin[0] if old_admin else 1
-
-    await execute(
-        """
-        INSERT INTO admins
-        (user_id, level, department_id, position, appointed_by, appointed_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            level = excluded.level,
-            department_id = excluded.department_id,
-            position = excluded.position,
-            appointed_by = excluded.appointed_by,
-            appointed_at = excluded.appointed_at
-        """,
-        (
-            target,
-            level,
-            dept_id,
-            position,
-            message.from_user.id,
-            int(time.time())
-        )
-    )
-
-    await log_department(
-        dept_id,
-        message.from_user.id,
-        target,
-        "Назначение руководителя",
-        POSITIONS[position]
-    )
-
-    username = await user_display(target)
-
-    try:
-        await bot.send_message(
-            target,
-            "Вас назначили сотрудником ANONBOTSCHOOL15.\n\n"
-            f"Отделение: {department[0]}\n"
-            f"Должность: {POSITIONS[position]}\n"
-            f"Уровень: {LEVELS[level]}"
-        )
-    except Exception:
-        pass
-
-    await state.clear()
-
-    await message.answer(
-        "Назначение выполнено!\n\n"
-        f"Пользователь: {username}\n"
-        f"Отделение: {department[0]}\n"
-        f"Должность: {POSITIONS[position]}\n"
-        f"Уровень: {LEVELS[level]}"
-    )
-
-
-
 # =====================================================
 # DEPARTMENT LOGS
 # =====================================================
@@ -1535,52 +1439,117 @@ async def appoint_id_handler(
     message: Message,
     state: FSMContext
 ):
+    """Единый обработчик ID: назначение администратора или руководителя отдела."""
 
     if message.from_user.id != OWNER_ID:
         await state.clear()
         return
 
+    if not message.text or not message.text.strip().isdigit():
+        await message.answer("Введите корректный числовой Telegram ID.")
+        return
+
+    target = int(message.text.strip())
+
+    if target == OWNER_ID:
+        await message.answer("Создателя нельзя назначить сотрудником.")
+        return
+
     data = await state.get_data()
 
+    # Сценарий 1: обычное назначение администратора.
     if data.get("action") == "admin_appoint":
-
-        if not message.text or not message.text.strip().isdigit():
-            await message.answer("Введите числовой Telegram ID.")
-            return
-
-        target = int(message.text.strip())
-
-        if target == OWNER_ID:
-            await message.answer("Вы уже являетесь создателем.")
-            await state.clear()
-            return
-
         await state.update_data(target_id=target)
         await state.set_state(States.appoint_level)
 
         buttons = [
-            [
-                InlineKeyboardButton(
-                    text=f"{level} уровень — {name}",
-                    callback_data=f"a:setlevel:{level}"
-                )
-            ]
+            [InlineKeyboardButton(
+                text=f"{level} уровень — {name}",
+                callback_data=f"a:setlevel:{level}"
+            )]
             for level, name in LEVELS.items()
             if level < 6
         ]
 
         await message.answer(
+            f"Пользователь: {await user_display(target)}\n\n"
             "Выберите уровень администратора:",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=buttons
-            )
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
         )
         return
 
-    # Если действие не является назначением администратора,
-    # обработчик отдела продолжит работу отдельным сценарием.
+    # Сценарий 2: назначение начальника или заместителя отдела.
+    dept_id = data.get("department_id")
+    position = data.get("position")
+
+    if not dept_id or position not in ("head", "deputy"):
+        await message.answer("Ошибка назначения. Начните заново через меню.")
+        await state.clear()
+        return
+
+    department = await one(
+        "SELECT name FROM departments WHERE id = ?",
+        (dept_id,)
+    )
+
+    if not department:
+        await message.answer("Отделение не найдено.")
+        await state.clear()
+        return
+
+    old_admin = await get_admin(target)
+    level = old_admin[0] if old_admin else 1
+
+    await execute(
+        """
+        INSERT INTO admins
+        (user_id, level, department_id, position, appointed_by, appointed_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            level = excluded.level,
+            department_id = excluded.department_id,
+            position = excluded.position,
+            appointed_by = excluded.appointed_by,
+            appointed_at = excluded.appointed_at
+        """,
+        (
+            target,
+            level,
+            dept_id,
+            position,
+            message.from_user.id,
+            int(time.time())
+        )
+    )
+
+    await log_department(
+        dept_id,
+        message.from_user.id,
+        target,
+        "Назначение руководителя",
+        POSITIONS[position]
+    )
+
+    username = await user_display(target)
+
+    try:
+        await bot.send_message(
+            target,
+            "Вас назначили сотрудником ANONBOTSCHOOL15.\n\n"
+            f"Отделение: {department[0]}\n"
+            f"Должность: {POSITIONS[position]}\n"
+            f"Уровень: {LEVELS[level]}"
+        )
+    except Exception:
+        logging.exception("Не удалось уведомить назначенного сотрудника")
+
+    await state.clear()
     await message.answer(
-        "Не удалось определить действие. Используйте /cancel."
+        "Назначение выполнено!\n\n"
+        f"Пользователь: {username}\n"
+        f"Отделение: {department[0]}\n"
+        f"Должность: {POSITIONS[position]}\n"
+        f"Уровень: {LEVELS[level]}"
     )
 
 
