@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import os
@@ -1290,18 +1289,18 @@ async def department_appoint_start(
     await callback.answer()
 
 
+
 @dp.message(States.appoint_id)
 async def department_appoint_finish(
     message: Message,
     state: FSMContext
 ):
-
     if message.from_user.id != OWNER_ID:
         await state.clear()
         return
 
     if not message.text or not message.text.strip().isdigit():
-        await message.answer("Введите корректный числовой Telegram ID.")
+        await message.answer("Введите корректный Telegram ID.")
         return
 
     target = int(message.text.strip())
@@ -1310,28 +1309,49 @@ async def department_appoint_finish(
     dept_id = data.get("department_id")
     position = data.get("position")
 
+    if not dept_id or position not in ("head", "deputy"):
+        await message.answer("Ошибка назначения. Начните заново.")
+        await state.clear()
+        return
+
     if target == OWNER_ID:
-        await message.answer("Создателя нельзя назначить сотрудником отделения.")
+        await message.answer("Создателя нельзя назначить сотрудником.")
         return
 
-    admin = await get_admin(target)
+    department = await one(
+        "SELECT name FROM departments WHERE id = ?",
+        (dept_id,)
+    )
 
-    if not admin:
-        await message.answer(
-            "Этот пользователь ещё не является администратором. "
-            "Сначала назначьте его через меню администрации."
-        )
+    if not department:
+        await message.answer("Отделение не найдено.")
+        await state.clear()
         return
 
-    old_position = admin[2] or "staff"
+    old_admin = await get_admin(target)
+
+    level = old_admin[0] if old_admin else 1
 
     await execute(
         """
-        UPDATE admins
-        SET department_id = ?, position = ?
-        WHERE user_id = ?
+        INSERT INTO admins
+        (user_id, level, department_id, position, appointed_by, appointed_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            level = excluded.level,
+            department_id = excluded.department_id,
+            position = excluded.position,
+            appointed_by = excluded.appointed_by,
+            appointed_at = excluded.appointed_at
         """,
-        (dept_id, position, target)
+        (
+            target,
+            level,
+            dept_id,
+            position,
+            message.from_user.id,
+            int(time.time())
+        )
     )
 
     await log_department(
@@ -1342,10 +1362,15 @@ async def department_appoint_finish(
         POSITIONS[position]
     )
 
+    username = await user_display(target)
+
     try:
         await bot.send_message(
             target,
-            f"Вас назначили на должность «{POSITIONS[position]}»."
+            "Вас назначили сотрудником ANONBOTSCHOOL15.\n\n"
+            f"Отделение: {department[0]}\n"
+            f"Должность: {POSITIONS[position]}\n"
+            f"Уровень: {LEVELS[level]}"
         )
     except Exception:
         pass
@@ -1353,8 +1378,13 @@ async def department_appoint_finish(
     await state.clear()
 
     await message.answer(
-        f"Пользователь {target} назначен: {POSITIONS[position]}."
+        "Назначение выполнено!\n\n"
+        f"Пользователь: {username}\n"
+        f"Отделение: {department[0]}\n"
+        f"Должность: {POSITIONS[position]}\n"
+        f"Уровень: {LEVELS[level]}"
     )
+
 
 
 # =====================================================
