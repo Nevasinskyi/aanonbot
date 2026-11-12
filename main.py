@@ -3,11 +3,12 @@ import asyncio
 import logging
 import os
 import time
+from pathlib import Path
 
 import aiosqlite
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -21,168 +22,629 @@ from aiogram.utils.deep_linking import create_start_link
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
 
-# ==================================================
+# =====================================================
 # CONFIG
-# ==================================================
+# =====================================================
 
 TOKEN = os.getenv("BOT_TOKEN", "9161228684:AAFxd7VQ1LwIo2ewaTnc8wQMrjSmGdh8haE")
-ADMIN_IDS = {
-    int(x.strip())
-    for x in os.getenv("ADMIN_IDS", "8792199502").split(",")
-    if x.strip().isdigit()
-}
-
+OWNER_ID = int(os.getenv("OWNER_ID", "8792199502"))
+CHANNEL_ID = os.getenv("ADMIN_CHANNEL_ID", "-1004412233871")
 DB_PATH = os.getenv("DB_PATH", "anonbot.db")
 
 if not TOKEN:
-    raise RuntimeError("Не задан BOT_TOKEN!")
+    raise RuntimeError("Не указан BOT_TOKEN")
+
+if OWNER_ID <= 0:
+    raise RuntimeError("Не указан OWNER_ID")
+
+CHANNEL_ID = int(CHANNEL_ID) if CHANNEL_ID.lstrip("-").isdigit() else None
+
+Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO)
 
-bot = Bot(token=TOKEN)
+bot = Bot(TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 
-# ==================================================
+# =====================================================
+# LEVELS
+# =====================================================
+
+LEVELS = {
+    1: "Младший модератор",
+    2: "Модератор",
+    3: "Администратор",
+    4: "Старший администратор",
+    5: "Помощник создателя",
+    6: "Создатель"
+}
+
+POSITIONS = {
+    "staff": "Сотрудник",
+    "deputy": "Заместитель начальника",
+    "head": "Начальник"
+}
+
+DEFAULT_DEPARTMENTS = [
+    "Модерация",
+    "Контроль",
+    "Поддержка",
+    "Безопасность"
+]
+
+
+# =====================================================
 # STATES
-# ==================================================
+# =====================================================
 
-class AnonStates(StatesGroup):
-    waiting_for_message = State()
-    waiting_for_reply = State()
+class States(StatesGroup):
+    message = State()
+    reply = State()
+
+    appoint_id = State()
+    appoint_level = State()
+    appoint_department = State()
+
+    department_name = State()
+    warning_id = State()
+    warning_reason = State()
 
 
-# ==================================================
+# =====================================================
 # DATABASE
-# ==================================================
+# =====================================================
+
+async def execute(query, params=()):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(query, params)
+        await db.commit()
+
+
+async def one(query, params=()):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(query, params) as cursor:
+            return await cursor.fetchone()
+
+
+async def all_rows(query, params=()):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(query, params) as cursor:
+            return await cursor.fetchall()
+
 
 async def init_db():
+
     async with aiosqlite.connect(DB_PATH) as db:
 
-        await db.execute("""
+        tables = [
+            """
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 created_at INTEGER NOT NULL
             )
-        """)
-
-        await db.execute("""
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS departments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY,
+                level INTEGER NOT NULL,
+                department_id INTEGER,
+                position TEXT DEFAULT 'staff',
+                appointed_by INTEGER,
+                appointed_at INTEGER
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 sender_id INTEGER NOT NULL,
                 target_id INTEGER NOT NULL,
+                content TEXT,
                 created_at INTEGER NOT NULL
             )
-        """)
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS blocks (
-                blocker_id INTEGER NOT NULL,
-                blocked_id INTEGER NOT NULL,
-                created_at INTEGER NOT NULL,
-                PRIMARY KEY (blocker_id, blocked_id)
-            )
-        """)
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS bans (
-                user_id INTEGER PRIMARY KEY,
-                admin_id INTEGER NOT NULL,
-                created_at INTEGER NOT NULL
-            )
-        """)
-
-        await db.execute("""
+            """,
+            """
             CREATE TABLE IF NOT EXISTS reports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 reporter_id INTEGER NOT NULL,
                 reported_id INTEGER NOT NULL,
+                content TEXT,
                 created_at INTEGER NOT NULL,
                 status TEXT DEFAULT 'open',
-                UNIQUE(reporter_id, reported_id)
+                reviewed_by INTEGER,
+                department_id INTEGER
             )
-        """)
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS ban_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                report_id INTEGER NOT NULL,
+                requester_id INTEGER NOT NULL,
+                target_id INTEGER NOT NULL,
+                reason TEXT,
+                status TEXT DEFAULT 'pending',
+                reviewed_by INTEGER,
+                created_at INTEGER NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS bans (
+                user_id INTEGER PRIMARY KEY,
+                admin_id INTEGER NOT NULL,
+                reason TEXT,
+                created_at INTEGER NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS blocks (
+                blocker_id INTEGER NOT NULL,
+                blocked_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY(blocker_id, blocked_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS warnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER NOT NULL,
+                issuer_id INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                active INTEGER DEFAULT 1
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS department_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                department_id INTEGER,
+                actor_id INTEGER NOT NULL,
+                target_id INTEGER,
+                action TEXT NOT NULL,
+                details TEXT,
+                created_at INTEGER NOT NULL
+            )
+            """
+        ]
+
+        for query in tables:
+            await db.execute(query)
+
+        # Миграции старых баз данных
+        migrations = {
+            "messages": [
+                ("content", "TEXT")
+            ],
+            "reports": [
+                ("content", "TEXT"),
+                ("reviewed_by", "INTEGER"),
+                ("department_id", "INTEGER")
+            ],
+            "admins": [
+                ("department_id", "INTEGER"),
+                ("position", "TEXT DEFAULT 'staff'"),
+                ("appointed_by", "INTEGER"),
+                ("appointed_at", "INTEGER")
+            ]
+        }
+
+        for table, columns in migrations.items():
+
+            async with db.execute(
+                f"PRAGMA table_info({table})"
+            ) as cursor:
+                existing = {
+                    row[1] for row in await cursor.fetchall()
+                }
+
+            for name, definition in columns:
+                if name not in existing:
+                    await db.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
+                    )
+
+        for name in DEFAULT_DEPARTMENTS:
+            await db.execute(
+                "INSERT OR IGNORE INTO departments(name) VALUES (?)",
+                (name,)
+            )
 
         await db.commit()
 
 
-async def register_user(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO users VALUES (?, ?)",
-            (user_id, int(time.time()))
-        )
-        await db.commit()
+# =====================================================
+# BASIC FUNCTIONS
+# =====================================================
+
+async def register_user(uid):
+    await execute(
+        "INSERT OR IGNORE INTO users VALUES (?, ?)",
+        (uid, int(time.time()))
+    )
 
 
-async def is_banned(user_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT 1 FROM bans WHERE user_id = ?",
-            (user_id,)
-        ) as cursor:
-            return await cursor.fetchone() is not None
+async def get_level(uid):
+
+    if uid == OWNER_ID:
+        return 6
+
+    result = await one(
+        "SELECT level FROM admins WHERE user_id = ?",
+        (uid,)
+    )
+
+    return result[0] if result else 0
 
 
-async def is_blocked(sender_id: int, target_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            """
-            SELECT 1 FROM blocks
-            WHERE blocker_id = ? AND blocked_id = ?
-            """,
-            (target_id, sender_id)
-        ) as cursor:
-            return await cursor.fetchone() is not None
+async def get_admin(uid):
+    return await one(
+        """
+        SELECT level, department_id, position
+        FROM admins WHERE user_id = ?
+        """,
+        (uid,)
+    )
 
 
-async def check_rate_limit(user_id: int) -> bool:
-    now = int(time.time())
+async def get_department_name(department_id):
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            """
-            SELECT COUNT(*) FROM messages
-            WHERE sender_id = ? AND created_at > ?
-            """,
-            (user_id, now - 60)
-        ) as cursor:
-            result = await cursor.fetchone()
+    if not department_id:
+        return "Без отделения"
+
+    result = await one(
+        "SELECT name FROM departments WHERE id = ?",
+        (department_id,)
+    )
+
+    return result[0] if result else "Неизвестное отделение"
+
+
+async def is_banned(uid):
+    return await one(
+        "SELECT 1 FROM bans WHERE user_id = ?",
+        (uid,)
+    ) is not None
+
+
+async def log_department(dept, actor, target, action, details=""):
+
+    await execute(
+        """
+        INSERT INTO department_logs
+        (department_id, actor_id, target_id, action, details, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (dept, actor, target, action, details, int(time.time()))
+    )
+
+    await channel_log(
+        "ЖУРНАЛ ОТДЕЛЕНИЯ\n\n"
+        f"Отделение: {await get_department_name(dept)}\n"
+        f"Действие: {action}\n"
+        f"Инициатор: {actor}\n"
+        f"Пользователь: {target or '—'}\n"
+        f"Подробности: {details or '—'}"
+    )
+
+
+async def channel_log(text):
+
+    if not CHANNEL_ID:
+        return
+
+    try:
+        await bot.send_message(CHANNEL_ID, text)
+    except Exception:
+        logging.exception("Ошибка публикации в канал")
+
+
+async def is_blocked(sender, target):
+
+    return await one(
+        """
+        SELECT 1 FROM blocks
+        WHERE blocker_id = ? AND blocked_id = ?
+        """,
+        (target, sender)
+    ) is not None
+
+
+async def rate_allowed(uid):
+
+    result = await one(
+        """
+        SELECT COUNT(*) FROM messages
+        WHERE sender_id = ? AND created_at > ?
+        """,
+        (uid, int(time.time()) - 60)
+    )
 
     return result[0] < 5
 
 
-async def log_message(sender_id: int, target_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            INSERT INTO messages
-            (sender_id, target_id, created_at)
-            VALUES (?, ?, ?)
-            """,
-            (sender_id, target_id, int(time.time()))
-        )
-        await db.commit()
+# =====================================================
+# DEPARTMENT PERMISSIONS
+# =====================================================
+
+async def department_access(uid):
+
+    if uid == OWNER_ID:
+        return {
+            "level": 6,
+            "department_id": None,
+            "position": "owner"
+        }
+
+    admin = await get_admin(uid)
+
+    if not admin:
+        return None
+
+    return {
+        "level": admin[0],
+        "department_id": admin[1],
+        "position": admin[2] or "staff"
+    }
 
 
-# ==================================================
+async def can_manage_department(actor, target):
+
+    if actor == OWNER_ID:
+        return True
+
+    a = await department_access(actor)
+    t = await department_access(target)
+
+    if not a or not t:
+        return False
+
+    if a["department_id"] is None:
+        return False
+
+    if a["department_id"] != t["department_id"]:
+        return False
+
+    if a["position"] != "head":
+        return False
+
+    return t["position"] == "staff" and t["level"] < a["level"]
+
+
+async def can_view_department(actor, dept_id):
+
+    if actor == OWNER_ID:
+        return True
+
+    admin = await department_access(actor)
+
+    if not admin:
+        return False
+
+    if admin["level"] < 1:
+        return False
+
+    return admin["department_id"] == dept_id
+
+
+# =====================================================
 # KEYBOARDS
-# ==================================================
+# =====================================================
 
-def main_keyboard(link: str):
+def main_keyboard():
+
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Моя анонимная ссылка",
-                    url=link
+                    text="Моя ссылка",
+                    callback_data="my_link"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Помощь",
+                    callback_data="user_help"
                 )
             ]
         ]
     )
 
 
-def message_keyboard(sender_id: int):
+def admin_keyboard():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Жалобы",
+                    callback_data="a:reports"
+                ),
+                InlineKeyboardButton(
+                    text="Запросы на бан",
+                    callback_data="a:requests"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Статистика",
+                    callback_data="a:stats"
+                ),
+                InlineKeyboardButton(
+                    text="Пользователи",
+                    callback_data="a:users"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Моё отделение",
+                    callback_data="d:home"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Администрация",
+                    callback_data="a:staff"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Управление отделениями",
+                    callback_data="d:list"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Назначить администратора",
+                    callback_data="a:appoint"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Выговор",
+                    callback_data="a:warning"
+                )
+            ]
+        ]
+    )
+
+
+def back_button(destination="admin"):
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Назад",
+                    callback_data=f"back:{destination}"
+                )
+            ]
+        ]
+    )
+
+
+# =====================================================
+# START
+# =====================================================
+
+@dp.message(CommandStart())
+async def start(message: Message, state: FSMContext):
+
+    await state.clear()
+
+    uid = message.from_user.id
+
+    if await is_banned(uid):
+        await message.answer("Ваш доступ к боту ограничен.")
+        return
+
+    await register_user(uid)
+
+    args = message.text.split(maxsplit=1)
+
+    if len(args) > 1:
+
+        payload = args[1]
+
+        if not payload.isdigit():
+            await message.answer("Некорректная ссылка.")
+            return
+
+        target = int(payload)
+
+        if target == uid:
+            await message.answer("Нельзя отправить сообщение самому себе.")
+            return
+
+        if await is_banned(target):
+            await message.answer("Получатель недоступен.")
+            return
+
+        await state.update_data(target_id=target)
+        await state.set_state(States.message)
+
+        await message.answer(
+            "Вы можете отправить анонимное сообщение.\n\n"
+            "Напишите текст или отправьте медиа.\n"
+            "Для отмены используйте /cancel."
+        )
+        return
+
+    link = await create_start_link(bot, str(uid), encode=False)
+
+    await message.answer(
+        "✦ ANONBOTSCHOOL15 ✦\n\n"
+        "Добро пожаловать!\n"
+        "Получайте и отправляйте анонимные сообщения.\n\n"
+        f"Ваша ссылка:\n{link}",
+        reply_markup=main_keyboard()
+    )
+
+
+@dp.callback_query(F.data == "my_link")
+async def my_link(callback: CallbackQuery):
+
+    link = await create_start_link(
+        bot,
+        str(callback.from_user.id),
+        encode=False
+    )
+
+    await callback.message.answer(
+        f"Ваша анонимная ссылка:\n{link}"
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "user_help")
+async def user_help(callback: CallbackQuery):
+
+    await callback.message.answer(
+        "Как пользоваться ботом:\n\n"
+        "1. Скопируйте личную ссылку.\n"
+        "2. Поделитесь ею с друзьями.\n"
+        "3. Получайте анонимные сообщения.\n"
+        "4. Отвечайте через кнопку под сообщением.\n"
+        "5. Используйте жалобу при нарушениях."
+    )
+
+    await callback.answer()
+
+
+@dp.message(Command("myid"))
+async def myid(message: Message):
+    await message.answer(f"Ваш ID: {message.from_user.id}")
+
+
+@dp.message(Command("help"))
+async def help_command(message: Message):
+    await message.answer(
+        "/start — главное меню\n"
+        "/admin — администрация\n"
+        "/myid — узнать ID\n"
+        "/dept — моё отделение\n"
+        "/cancel — отменить действие"
+    )
+
+
+@dp.message(Command("cancel"))
+async def cancel(message: Message, state: FSMContext):
+
+    await state.clear()
+    await message.answer("Действие отменено.")
+
+
+# =====================================================
+# ANONYMOUS MESSAGES
+# =====================================================
+
+def message_actions(sender_id):
+
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -193,7 +655,7 @@ def message_keyboard(sender_id: int):
             ],
             [
                 InlineKeyboardButton(
-                    text="Пожаловаться",
+                    text="Жалоба",
                     callback_data=f"report:{sender_id}"
                 ),
                 InlineKeyboardButton(
@@ -205,300 +667,141 @@ def message_keyboard(sender_id: int):
     )
 
 
-def admin_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Статистика",
-                    callback_data="admin:stats"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="Жалобы",
-                    callback_data="admin:reports"
-                )
-            ]
-        ]
-    )
+@dp.message(States.message)
+async def receive_message(message: Message, state: FSMContext):
 
+    uid = message.from_user.id
 
-# ==================================================
-# START
-# ==================================================
-
-@dp.message(CommandStart())
-async def start(message: Message, state: FSMContext):
-
-    await state.clear()
-
-    user_id = message.from_user.id
-
-    if await is_banned(user_id):
-        await message.answer("Ваш доступ к боту ограничен.")
-        return
-
-    await register_user(user_id)
-
-    args = message.text.split(maxsplit=1)
-
-    if len(args) > 1:
-
-        payload = args[1].strip()
-
-        if not payload.isdigit():
-            await message.answer("Некорректная ссылка.")
-            return
-
-        target_id = int(payload)
-
-        if target_id == user_id:
-            await message.answer(
-                "Нельзя отправить сообщение самому себе."
-            )
-            return
-
-        if await is_banned(target_id):
-            await message.answer("Получатель недоступен.")
-            return
-
-        await state.update_data(target_id=target_id)
-
-        await state.set_state(
-            AnonStates.waiting_for_message
-        )
-
-        await message.answer(
-            "Вы можете отправить анонимное сообщение.\n\n"
-            "Отправьте текст, фотографию, видео, "
-            "голосовое сообщение или стикер.\n\n"
-            "Получатель не увидит ваш Telegram-аккаунт.\n\n"
-            "/cancel — отменить отправку."
-        )
-        return
-
-    link = await create_start_link(
-        bot,
-        str(user_id),
-        encode=False
-    )
-
-    await message.answer(
-        "Добро пожаловать в AnonBotShkola15!\n\n"
-        "Здесь вы можете получать анонимные сообщения.\n\n"
-        "Ваша персональная ссылка:\n"
-        f"{link}\n\n"
-        "Поделитесь ссылкой с друзьями!",
-        reply_markup=main_keyboard(link)
-    )
-
-
-# ==================================================
-# CANCEL
-# ==================================================
-
-@dp.message(Command("cancel"))
-async def cancel(message: Message, state: FSMContext):
-
-    if await state.get_state() is None:
-        await message.answer("Нет активного действия.")
-        return
-
-    await state.clear()
-    await message.answer("Действие отменено.")
-
-
-# ==================================================
-# HELP AND USER ID
-# ==================================================
-
-@dp.message(Command("help"))
-async def help_command(message: Message):
-    await message.answer(
-        "AnonBotShkola15 — анонимные сообщения.\n\n"
-        "/start — главное меню\n"
-        "/cancel — отменить действие\n"
-        "/help — помощь\n"
-        "/myid — узнать свой ID\n\n"
-        "Не отправляйте личные данные незнакомым людям."
-    )
-
-
-@dp.message(Command("myid"))
-async def myid(message: Message):
-    await message.answer(
-        f"Ваш Telegram ID: {message.from_user.id}"
-    )
-
-
-# ==================================================
-# ANONYMOUS MESSAGE
-# ==================================================
-
-@dp.message(AnonStates.waiting_for_message)
-async def receive_message(
-    message: Message,
-    state: FSMContext
-):
-
-    sender_id = message.from_user.id
-
-    if await is_banned(sender_id):
+    if await is_banned(uid):
         await state.clear()
         await message.answer("Ваш доступ ограничен.")
         return
 
     if message.text and message.text.startswith("/"):
-        await message.answer(
-            "Команды нельзя отправлять как сообщения.\n"
-            "Используйте /cancel для отмены."
-        )
+        await message.answer("Используйте /cancel для отмены.")
         return
 
     data = await state.get_data()
-    target_id = data.get("target_id")
+    target = data.get("target_id")
 
-    if not target_id:
+    if not target:
         await state.clear()
         await message.answer("Ошибка. Откройте ссылку заново.")
         return
 
-    if await is_blocked(sender_id, target_id):
+    if await is_blocked(uid, target):
         await state.clear()
-        await message.answer(
-            "Вы не можете отправить сообщение этому пользователю."
-        )
+        await message.answer("Получатель заблокировал вас.")
         return
 
-    if not await check_rate_limit(sender_id):
-        await message.answer(
-            "Слишком много сообщений. "
-            "Попробуйте через минуту."
-        )
+    if not await rate_allowed(uid):
+        await message.answer("Лимит: 5 сообщений в минуту.")
         return
 
     try:
         await bot.copy_message(
-            chat_id=target_id,
-            from_chat_id=message.chat.id,
-            message_id=message.message_id,
-            reply_markup=message_keyboard(sender_id)
+            target,
+            message.chat.id,
+            message.message_id,
+            reply_markup=message_actions(uid)
         )
 
-        await log_message(sender_id, target_id)
-
-        await message.answer(
-            "Ваше анонимное сообщение отправлено!"
+        content = (
+            message.text
+            or message.caption
+            or "[Медиа-сообщение]"
         )
 
+        await execute(
+            """
+            INSERT INTO messages(sender_id, target_id, content, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (uid, target, content[:4000], int(time.time()))
+        )
+
+        await message.answer("Сообщение отправлено анонимно.")
         await state.clear()
 
     except (TelegramBadRequest, TelegramForbiddenError):
-        await message.answer(
-            "Не удалось доставить сообщение. "
-            "Возможно, получатель недоступен."
-        )
+        await message.answer("Не удалось доставить сообщение.")
         await state.clear()
 
 
-# ==================================================
-# ANONYMOUS REPLY
-# ==================================================
-
 @dp.callback_query(F.data.startswith("reply:"))
-async def reply_callback(
-    callback: CallbackQuery,
-    state: FSMContext
-):
+async def reply_start(callback: CallbackQuery, state: FSMContext):
 
-    sender_id = callback.from_user.id
+    uid = callback.from_user.id
+    target = int(callback.data.split(":")[1])
 
-    if await is_banned(sender_id):
-        await callback.answer(
-            "Ваш доступ ограничен.",
-            show_alert=True
-        )
+    if await is_banned(uid):
+        await callback.answer("Доступ ограничен.", show_alert=True)
         return
 
-    target_id = int(callback.data.split(":")[1])
-
-    if target_id == sender_id:
-        await callback.answer("Некорректный запрос.")
-        return
-
-    if await is_blocked(sender_id, target_id):
-        await callback.answer(
-            "Вы заблокировали этого пользователя.",
-            show_alert=True
-        )
+    if uid == target:
+        await callback.answer("Некорректное действие.")
         return
 
     await state.clear()
+    await state.update_data(target_id=target)
+    await state.set_state(States.reply)
 
-    await state.update_data(target_id=target_id)
-
-    await state.set_state(AnonStates.waiting_for_reply)
+    await callback.message.answer(
+        "Напишите анонимный ответ.\n/cancel — отмена."
+    )
 
     await callback.answer()
 
-    await callback.message.answer(
-        "Напишите анонимный ответ.\n\n"
-        "/cancel — отменить."
-    )
 
+@dp.message(States.reply)
+async def send_reply(message: Message, state: FSMContext):
 
-@dp.message(AnonStates.waiting_for_reply)
-async def send_reply(
-    message: Message,
-    state: FSMContext
-):
+    uid = message.from_user.id
 
-    sender_id = message.from_user.id
-
-    if await is_banned(sender_id):
+    if await is_banned(uid):
         await state.clear()
-        await message.answer("Ваш доступ ограничен.")
         return
 
     if message.text and message.text.startswith("/"):
-        await message.answer(
-            "Команды нельзя отправлять как ответы.\n"
-            "Используйте /cancel."
-        )
+        await message.answer("Используйте /cancel.")
         return
 
     data = await state.get_data()
-    target_id = data.get("target_id")
+    target = data.get("target_id")
 
-    if not target_id:
+    if not target:
         await state.clear()
-        await message.answer("Ошибка. Попробуйте ещё раз.")
+        await message.answer("Ошибка.")
         return
 
-    if await is_blocked(sender_id, target_id):
+    if await is_blocked(uid, target):
         await state.clear()
-        await message.answer("Этот пользователь заблокировал вас.")
+        await message.answer("Получатель заблокировал вас.")
         return
 
-    if not await check_rate_limit(sender_id):
-        await message.answer(
-            "Слишком много сообщений. Попробуйте позже."
-        )
+    if not await rate_allowed(uid):
+        await message.answer("Лимит: 5 сообщений в минуту.")
         return
 
     try:
         await bot.copy_message(
-            chat_id=target_id,
-            from_chat_id=message.chat.id,
-            message_id=message.message_id,
-            reply_markup=message_keyboard(sender_id)
+            target,
+            message.chat.id,
+            message.message_id,
+            reply_markup=message_actions(uid)
         )
 
-        await log_message(sender_id, target_id)
+        content = message.text or message.caption or "[Медиа-сообщение]"
 
-        await message.answer("Анонимный ответ отправлен!")
+        await execute(
+            """
+            INSERT INTO messages(sender_id, target_id, content, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (uid, target, content[:4000], int(time.time()))
+        )
 
+        await message.answer("Ответ отправлен.")
         await state.clear()
 
     except (TelegramBadRequest, TelegramForbiddenError):
@@ -506,60 +809,64 @@ async def send_reply(
         await state.clear()
 
 
-# ==================================================
-# BLOCK USER
-# ==================================================
+# =====================================================
+# BLOCK AND REPORT
+# =====================================================
 
 @dp.callback_query(F.data.startswith("block:"))
 async def block_user(callback: CallbackQuery):
 
-    blocker_id = callback.from_user.id
-    blocked_id = int(callback.data.split(":")[1])
+    uid = callback.from_user.id
+    target = int(callback.data.split(":")[1])
 
-    if blocker_id == blocked_id:
-        await callback.answer("Некорректный запрос.")
+    if uid == target:
+        await callback.answer("Некорректное действие.")
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            INSERT OR IGNORE INTO blocks
-            VALUES (?, ?, ?)
-            """,
-            (blocker_id, blocked_id, int(time.time()))
-        )
-        await db.commit()
-
-    await callback.answer(
-        "Пользователь заблокирован.",
-        show_alert=True
+    await execute(
+        """
+        INSERT OR IGNORE INTO blocks VALUES (?, ?, ?)
+        """,
+        (uid, target, int(time.time()))
     )
 
+    await callback.answer("Пользователь заблокирован.", show_alert=True)
 
-# ==================================================
-# REPORT USER
-# ==================================================
 
 @dp.callback_query(F.data.startswith("report:"))
 async def report_user(callback: CallbackQuery):
 
-    reporter_id = callback.from_user.id
-    reported_id = int(callback.data.split(":")[1])
+    reporter = callback.from_user.id
+    target = int(callback.data.split(":")[1])
 
-    if reporter_id == reported_id:
-        await callback.answer("Некорректный запрос.")
+    if reporter == target:
+        await callback.answer("Некорректное действие.")
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            INSERT OR IGNORE INTO reports
-            (reporter_id, reported_id, created_at)
-            VALUES (?, ?, ?)
-            """,
-            (reporter_id, reported_id, int(time.time()))
-        )
-        await db.commit()
+    if await is_banned(reporter):
+        await callback.answer("Доступ ограничен.", show_alert=True)
+        return
+
+    content = (
+        callback.message.text
+        or callback.message.caption
+        or "[Медиа-сообщение]"
+    )[:4000]
+
+    dept = await one(
+        "SELECT id FROM departments WHERE name = 'Модерация'"
+    )
+
+    dept_id = dept[0] if dept else None
+
+    await execute(
+        """
+        INSERT INTO reports
+        (reporter_id, reported_id, content, created_at, department_id)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (reporter, target, content, int(time.time()), dept_id)
+    )
 
     await callback.answer(
         "Жалоба отправлена администрации.",
@@ -567,248 +874,123 @@ async def report_user(callback: CallbackQuery):
     )
 
 
-# ==================================================
-# ADMIN CHECK
-# ==================================================
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-
-# ==================================================
+# =====================================================
 # ADMIN PANEL
-# ==================================================
+# =====================================================
 
 @dp.message(Command("admin"))
 async def admin_panel(message: Message):
 
-    if not is_admin(message.from_user.id):
-        await message.answer("У вас нет доступа.")
+    level = await get_level(message.from_user.id)
+
+    if level < 1:
+        await message.answer("Нет доступа к администрации.")
         return
 
     await message.answer(
-        "ADMIN PANEL\n\n"
-        "Управление AnonBotShkola15",
+        "✦ ANONBOTSCHOOL15 ✦\n"
+        "АДМИНИСТРАТИВНАЯ ПАНЕЛЬ\n\n"
+        f"Уровень: {level}\n"
+        f"Должность: {LEVELS[level]}",
         reply_markup=admin_keyboard()
     )
 
 
-@dp.callback_query(F.data.startswith("admin:"))
-async def admin_callback(callback: CallbackQuery):
+@dp.callback_query(F.data == "back:admin")
+async def back_admin(callback: CallbackQuery):
 
-    if not is_admin(callback.from_user.id):
-        await callback.answer(
-            "Доступ запрещён.",
-            show_alert=True
-        )
+    level = await get_level(callback.from_user.id)
+
+    if level < 1:
+        await callback.answer("Доступ запрещён.")
         return
 
-    action = callback.data.split(":")[1]
-
-    if action == "stats":
-
-        async with aiosqlite.connect(DB_PATH) as db:
-
-            async with db.execute(
-                "SELECT COUNT(*) FROM users"
-            ) as cursor:
-                users = (await cursor.fetchone())[0]
-
-            async with db.execute(
-                "SELECT COUNT(*) FROM messages"
-            ) as cursor:
-                messages = (await cursor.fetchone())[0]
-
-            async with db.execute(
-                "SELECT COUNT(*) FROM reports WHERE status='open'"
-            ) as cursor:
-                reports = (await cursor.fetchone())[0]
-
-            async with db.execute(
-                "SELECT COUNT(*) FROM bans"
-            ) as cursor:
-                bans = (await cursor.fetchone())[0]
-
-        await callback.message.answer(
-            "СТАТИСТИКА ANONBOTSCHOOL15\n\n"
-            f"Пользователей: {users}\n"
-            f"Сообщений: {messages}\n"
-            f"Открытых жалоб: {reports}\n"
-            f"Заблокировано: {bans}"
-        )
-
-    elif action == "reports":
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute(
-                """
-                SELECT id, reporter_id, reported_id
-                FROM reports
-                WHERE status = 'open'
-                ORDER BY id DESC
-                LIMIT 10
-                """
-            ) as cursor:
-                reports = await cursor.fetchall()
-
-        if not reports:
-            await callback.message.answer("Новых жалоб нет.")
-        else:
-            for report_id, reporter_id, reported_id in reports:
-
-                keyboard = InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [
-                            InlineKeyboardButton(
-                                text="Закрыть жалобу",
-                                callback_data=f"resolve:{report_id}"
-                            )
-                        ]
-                    ]
-                )
-
-                await callback.message.answer(
-                    f"Жалоба №{report_id}\n"
-                    f"Отправитель жалобы: {reporter_id}\n"
-                    f"Пользователь: {reported_id}",
-                    reply_markup=keyboard
-                )
+    await callback.message.answer(
+        "АДМИНИСТРАТИВНАЯ ПАНЕЛЬ",
+        reply_markup=admin_keyboard()
+    )
 
     await callback.answer()
 
 
-# ==================================================
-# RESOLVE REPORT
-# ==================================================
+# =====================================================
+# GENERAL STATISTICS
+# =====================================================
 
-@dp.callback_query(F.data.startswith("resolve:"))
-async def resolve_report(callback: CallbackQuery):
+@dp.callback_query(F.data == "a:stats")
+async def admin_stats(callback: CallbackQuery):
 
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Доступ запрещён.")
+    if await get_level(callback.from_user.id) < 2:
+        await callback.answer("Доступно со 2 уровня.", show_alert=True)
         return
 
-    try:
-        report_id = int(callback.data.split(":")[1])
-    except ValueError:
-        await callback.answer("Некорректный ID.")
-        return
+    users = (await one("SELECT COUNT(*) FROM users"))[0]
+    messages = (await one("SELECT COUNT(*) FROM messages"))[0]
+    reports = (await one(
+        "SELECT COUNT(*) FROM reports WHERE status='open'"
+    ))[0]
+    bans = (await one("SELECT COUNT(*) FROM bans"))[0]
+    admins = (await one("SELECT COUNT(*) FROM admins"))[0]
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            UPDATE reports
-            SET status = 'closed'
-            WHERE id = ?
-            """,
-            (report_id,)
-        )
-        await db.commit()
-
-    await callback.answer("Жалоба закрыта.")
-    await callback.message.edit_text(
-        f"Жалоба №{report_id} закрыта."
+    await callback.message.answer(
+        "ОБЩАЯ СТАТИСТИКА\n\n"
+        f"Пользователи: {users}\n"
+        f"Сообщения: {messages}\n"
+        f"Открытые жалобы: {reports}\n"
+        f"Блокировки: {bans}\n"
+        f"Администраторы: {admins}",
+        reply_markup=back_button()
     )
 
+    await callback.answer()
 
-# ==================================================
-# BAN / UNBAN
-# ==================================================
 
-@dp.message(Command("ban"))
-async def ban_user(message: Message):
+# =====================================================
+# USER LIST
+# =====================================================
 
-    if not is_admin(message.from_user.id):
-        await message.answer("Доступ запрещён.")
+@dp.callback_query(F.data == "a:users")
+async def user_list(callback: CallbackQuery):
+
+    if await get_level(callback.from_user.id) < 2:
+        await callback.answer("Доступно со 2 уровня.", show_alert=True)
         return
 
-    args = message.text.split()
-
-    if len(args) != 2 or not args[1].isdigit():
-        await message.answer(
-            "Использование: /ban USER_ID"
-        )
-        return
-
-    user_id = int(args[1])
-
-    if user_id in ADMIN_IDS:
-        await message.answer("Нельзя заблокировать администратора.")
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            INSERT OR REPLACE INTO bans
-            VALUES (?, ?, ?)
-            """,
-            (user_id, message.from_user.id, int(time.time()))
-        )
-        await db.commit()
-
-    await message.answer(
-        f"Пользователь {user_id} заблокирован."
+    users = await all_rows(
+        """
+        SELECT user_id, created_at
+        FROM users ORDER BY created_at DESC LIMIT 15
+        """
     )
 
+    count = (await one("SELECT COUNT(*) FROM users"))[0]
 
-@dp.message(Command("unban"))
-async def unban_user(message: Message):
+    text = f"ПОЛЬЗОВАТЕЛИ\nВсего: {count}\n\n"
 
-    if not is_admin(message.from_user.id):
-        await message.answer("Доступ запрещён.")
-        return
+    for uid, created in users:
+        date = time.strftime("%d.%m.%Y", time.localtime(created))
+        text += f"{uid} — {date}\n"
 
-    args = message.text.split()
-
-    if len(args) != 2 or not args[1].isdigit():
-        await message.answer(
-            "Использование: /unban USER_ID"
-        )
-        return
-
-    user_id = int(args[1])
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "DELETE FROM bans WHERE user_id = ?",
-            (user_id,)
-        )
-        await db.commit()
-
-    await message.answer(
-        f"Пользователь {user_id} разблокирован."
+    await callback.message.answer(
+        text,
+        reply_markup=back_button()
     )
 
-
-# ==================================================
-# UNKNOWN MESSAGE
-# ==================================================
-
-@dp.message()
-async def unknown_message(message: Message):
-
-    await message.answer(
-        "Используйте /start для открытия главного меню.\n"
-        "/help — список команд."
-    )
+    await callback.answer()
 
 
-# ==================================================
-# MAIN
-# ==================================================
+# =====================================================
+# DEPARTMENT HOME
+# =====================================================
 
-async def main():
+@dp.message(Command("dept"))
+async def department_command(message: Message):
 
-    await init_db()
-
-    print("================================")
-    print("AnonBotShkola15")
-    print("Database initialized")
-    print("Bot is running!")
-    print("================================")
-
-    await dp.start_polling(bot)
+    await show_department(message.from_user.id, message)
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+async def show_department(uid, destination):
+
+    access = await department_access(uid)
+
+    if not access or not access
